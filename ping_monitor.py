@@ -9,7 +9,7 @@ Environment variables:
 
 import os
 import socket
-import subprocess
+import struct
 import time
 import statistics
 from collections import deque
@@ -18,6 +18,8 @@ from typing import Optional, List
 import signal
 import sys
 import argparse
+import select
+import random
 
 
 @dataclass
@@ -25,6 +27,124 @@ class PingResult:
     timestamp: float
     rtt: Optional[float]  # RTT in milliseconds, None if packet lost
     success: bool
+
+
+class ICMPPing:
+    """ICMP ping implementation using raw sockets"""
+
+    def __init__(self):
+        self.icmp_id = random.randint(1, 65535)
+        self.sequence = 0
+
+    def checksum(self, data: bytes) -> int:
+        """Calculate ICMP checksum"""
+        # Add padding if odd length
+        if len(data) % 2:
+            data += b'\x00'
+
+        checksum = 0
+        for i in range(0, len(data), 2):
+            checksum += (data[i] << 8) + data[i + 1]
+
+        # Add carry bits
+        while checksum >> 16:
+            checksum = (checksum & 0xFFFF) + (checksum >> 16)
+
+        return ~checksum & 0xFFFF
+
+    def create_icmp_packet(self) -> bytes:
+        """Create ICMP echo request packet"""
+        self.sequence += 1
+
+        # ICMP header: type=8, code=0, checksum=0, id, sequence
+        header = struct.pack('!BBHHH', 8, 0, 0, self.icmp_id, self.sequence)
+
+        # Payload with timestamp
+        payload = struct.pack('!d', time.time())
+
+        # Calculate checksum
+        packet = header + payload
+        checksum = self.checksum(packet)
+
+        # Rebuild packet with correct checksum
+        header = struct.pack('!BBHHH', 8, 0, checksum, self.icmp_id, self.sequence)
+        return header + payload
+
+    def ping(self, host: str, timeout: float = 1.0) -> PingResult:
+        """Send ICMP ping to host and return result"""
+        timestamp = time.time()
+
+        try:
+            # Create raw socket (requires root/admin privileges)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            sock.settimeout(timeout)
+
+            # Create and send ICMP packet
+            packet = self.create_icmp_packet()
+            sock.sendto(packet, (host, 0))
+            send_time = time.time()
+
+            # Wait for response
+            while True:
+                ready = select.select([sock], [], [], timeout)
+                if not ready[0]:
+                    # Timeout
+                    sock.close()
+                    return PingResult(timestamp=timestamp, rtt=None, success=False)
+
+                recv_packet, addr = sock.recvfrom(1024)
+                recv_time = time.time()
+
+                # Parse IP header to get ICMP data
+                ip_header_len = (recv_packet[0] & 0x0F) * 4
+                icmp_packet = recv_packet[ip_header_len:]
+
+                # Parse ICMP header
+                if len(icmp_packet) >= 8:
+                    icmp_type, icmp_code, _, icmp_id, icmp_seq = struct.unpack('!BBHHH', icmp_packet[:8])
+
+                    # Check if this is our echo reply
+                    if icmp_type == 0 and icmp_id == self.icmp_id and icmp_seq == self.sequence:
+                        rtt = (recv_time - send_time) * 1000  # Convert to milliseconds
+                        sock.close()
+                        return PingResult(timestamp=timestamp, rtt=rtt, success=True)
+
+        except PermissionError:
+            # Raw socket requires root privileges, fall back to subprocess
+            sock.close() if 'sock' in locals() else None
+            return self._fallback_ping(host, timestamp)
+        except Exception as e:
+            sock.close() if 'sock' in locals() else None
+            return PingResult(timestamp=timestamp, rtt=None, success=False)
+
+        sock.close() if 'sock' in locals() else None
+        return PingResult(timestamp=timestamp, rtt=None, success=False)
+
+    def _fallback_ping(self, host: str, timestamp: float) -> PingResult:
+        """Fallback to subprocess ping when raw sockets are not available"""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['ping', '-c', '1', '-W', '1000', host],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+
+            if result.returncode == 0:
+                # Parse RTT from ping output
+                output_lines = result.stdout.split('\n')
+                for line in output_lines:
+                    if 'time=' in line:
+                        time_part = line.split('time=')[1].split()[0]
+                        rtt = float(time_part)
+                        return PingResult(timestamp=timestamp, rtt=rtt, success=True)
+                return PingResult(timestamp=timestamp, rtt=None, success=True)
+            else:
+                return PingResult(timestamp=timestamp, rtt=None, success=False)
+
+        except Exception:
+            return PingResult(timestamp=timestamp, rtt=None, success=False)
 
 
 class PingStatistics:
@@ -97,6 +217,7 @@ class PingMonitor:
         self.resolved_ip = self.resolve_hostname(target_host)
         self.stats = PingStatistics()
         self.verbose = verbose
+        self.icmp_ping = ICMPPing()
 
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -120,53 +241,20 @@ class PingMonitor:
         sys.exit(0)
 
     def ping_once(self) -> PingResult:
-        """Execute a single ping and return the result"""
-        timestamp = time.time()
+        """Execute a single ping using ICMP and return the result"""
+        ping_result = self.icmp_ping.ping(self.resolved_ip, timeout=1.0)
 
-        try:
-            # Use subprocess to execute ping command
-            # -c 1: send only 1 packet
-            # -W 1000: timeout of 1 second (1000ms)
-            result = subprocess.run(
-                ['ping', '-c', '1', '-W', '1000', self.resolved_ip],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-
-            if result.returncode == 0:
-                # Parse RTT from ping output
-                output_lines = result.stdout.split('\n')
-                for line in output_lines:
-                    if 'time=' in line:
-                        # Extract RTT value
-                        time_part = line.split('time=')[1].split()[0]
-                        rtt = float(time_part)
-                        ping_result = PingResult(timestamp=timestamp, rtt=rtt, success=True)
-
-                        # Display individual packet response in verbose mode
-                        if self.verbose:
-                            self.display_packet_response(ping_result, line.strip())
-
-                        return ping_result
-
-                # If we can't parse RTT but ping succeeded
-                ping_result = PingResult(timestamp=timestamp, rtt=None, success=True)
-                if self.verbose:
-                    self.display_packet_response(ping_result, "Ping succeeded but RTT could not be parsed")
-                return ping_result
+        # Display individual packet response in verbose mode
+        if self.verbose:
+            if ping_result.success and ping_result.rtt is not None:
+                detail = f"ICMP echo reply: seq={self.icmp_ping.sequence} time={ping_result.rtt:.2f}ms"
+                self.display_packet_response(ping_result, detail)
+            elif ping_result.success:
+                self.display_packet_response(ping_result, "ICMP ping succeeded but RTT could not be calculated")
             else:
-                # Ping failed
-                ping_result = PingResult(timestamp=timestamp, rtt=None, success=False)
-                if self.verbose:
-                    self.display_packet_response(ping_result, f"Ping failed (exit code: {result.returncode})")
-                return ping_result
+                self.display_packet_response(ping_result, "ICMP ping failed or timeout")
 
-        except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError) as e:
-            ping_result = PingResult(timestamp=timestamp, rtt=None, success=False)
-            if self.verbose:
-                self.display_packet_response(ping_result, f"Ping error: {str(e)}")
-            return ping_result
+        return ping_result
 
     def display_packet_response(self, result: PingResult, detail: str):
         """Display individual packet response in verbose mode"""
@@ -227,7 +315,11 @@ class PingMonitor:
         """Main monitoring loop"""
         print(f"Starting ping monitor for {self.target_host} ({self.resolved_ip})")
         print(f"Ping interval: {self.interval_seconds*1000:.0f}ms")
-        print("Collecting initial data...")
+        if self.verbose:
+            print("Verbose mode: ON")
+            print("Individual packet responses will be shown:")
+        else:
+            print("Collecting initial data...")
 
         last_display_time = 0
         display_interval = 1.0  # Update display every second
@@ -237,9 +329,9 @@ class PingMonitor:
             result = self.ping_once()
             self.stats.add_result(result)
 
-            # Update display if enough time has passed
+            # Update display if enough time has passed (only in non-verbose mode)
             current_time = time.time()
-            if current_time - last_display_time >= display_interval:
+            if not self.verbose and current_time - last_display_time >= display_interval:
                 self.display_status()
                 last_display_time = current_time
 
@@ -261,7 +353,7 @@ def main():
         print("Usage: TARGET_HOST=example.com python ping_monitor.py [--verbose]")
         sys.exit(1)
 
-    interval_ms = int(os.environ.get('PING_INTERVAL', 100))
+    interval_ms = int(os.environ.get('INTERVAL', 100))
 
     # Create and run monitor
     monitor = PingMonitor(target_host, interval_ms, verbose=args.verbose)

@@ -4,6 +4,7 @@
 
 ## 機能
 
+- **純粋なPython実装**: Raw socketを使用した直接ICMP送信（権限不足時は自動フォールバック）
 - ホスト名の自動解決
 - 可変ping間隔（デフォルト100ms）
 - リアルタイム統計表示：
@@ -30,6 +31,9 @@ TARGET_HOST=1.1.1.1 python ping_monitor.py
 # Verboseモード（個別パケット応答も表示）
 TARGET_HOST=google.com python ping_monitor.py --verbose
 TARGET_HOST=google.com python ping_monitor.py -v
+
+# Root権限で実行（推奨）- 直接ICMP送信
+sudo TARGET_HOST=google.com python ping_monitor.py --verbose
 ```
 
 ### Verboseモード
@@ -37,8 +41,8 @@ TARGET_HOST=google.com python ping_monitor.py -v
 `--verbose` または `-v` オプションを使用すると、統計情報に加えて個別パケットの応答状況もリアルタイムで表示されます。
 
 ```
-[14:30:15] ✓ 8.8.8.8:  12.34ms - 64 bytes from 8.8.8.8: icmp_seq=1 ttl=118 time=12.34 ms
-[14:30:16] ✗ 8.8.8.8: FAILED - Ping failed (exit code: 1)
+[14:30:15] ✓ 8.8.8.8:  12.34ms - ICMP echo reply: seq=1 time=12.34ms
+[14:30:16] ✗ 8.8.8.8: FAILED - ICMP ping failed or timeout
 ```
 
 - `✓`: 成功したパケット（RTT値と詳細情報を表示）
@@ -54,7 +58,7 @@ TARGET_HOST=google.com python ping_monitor.py -v
 
 - Python 3.6以上
 - Unix系OS（macOS、Linux）
-- `ping`コマンドが利用可能であること
+- **Root権限推奨**: 直接ICMPパケット送信のため（権限がない場合は自動的にpingコマンドにフォールバック）
 
 ## コマンドラインオプション
 
@@ -64,6 +68,25 @@ python ping_monitor.py [--verbose] [--help]
 
 - `--verbose`, `-v`: 個別パケット応答の詳細表示を有効化
 - `--help`, `-h`: ヘルプメッセージを表示
+
+## 実装詳細
+
+### ICMP送信方式
+
+1. **Raw Socket（推奨）**: Root権限で実行時
+   - Python標準ライブラリのみを使用
+   - 直接ICMPパケットを生成・送信
+   - より正確なRTT測定が可能
+
+2. **Subprocess フォールバック**: 権限不足時
+   - システムの`ping`コマンドを使用
+   - Root権限不要
+   - 従来通りの動作
+
+### 権限要件
+
+- **Raw Socket使用**: `sudo`または管理者権限が必要
+- **Subprocess使用**: 通常ユーザー権限で動作
 
 ## 停止方法
 
